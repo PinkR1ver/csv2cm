@@ -1,0 +1,232 @@
+import os
+import io
+from typing import List, Optional
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+from sklearn.metrics import confusion_matrix
+import sys
+
+
+APP_TITLE = "CSV → Confusion Matrix"
+DEFAULT_CSV_PATH = os.path.join(os.path.dirname(__file__), "data.csv")
+
+
+def configure_chinese_font() -> Optional[str]:
+	"""配置中文字体并返回首选字体名（若可用）。
+
+	- 在 macOS 上优先使用系统内置 PingFang 字体文件，确保中文可用；
+	- 其他平台提供回退链；
+	- 返回的字符串可用于 fontname 参数强制应用到轴标题与刻度。
+	"""
+	preferred_name: Optional[str] = None
+	if sys.platform == "darwin":
+		mac_font_files = [
+			"/System/Library/Fonts/PingFang.ttc",
+			"/System/Library/Fonts/Supplemental/Songti.ttc",
+			"/System/Library/Fonts/Supplemental/Heiti TC.ttc",
+		]
+		for p in mac_font_files:
+			if os.path.exists(p):
+				try:
+					font_manager.fontManager.addfont(p)
+					fp = font_manager.FontProperties(fname=p)
+					preferred_name = fp.get_name()
+					break
+				except Exception:
+					pass
+		# 同时设置回退链，若特定名称不可用仍可尝试其他中文字库
+		plt.rcParams["font.family"] = ["sans-serif"]
+		plt.rcParams["font.sans-serif"] = [
+			preferred_name or "PingFang SC",
+			"Hiragino Sans GB",
+			"Heiti SC",
+			"Songti SC",
+			"Arial Unicode MS",
+			"DejaVu Sans",
+		]
+		plt.rcParams["axes.unicode_minus"] = False
+		return preferred_name
+	# 其他平台回退链
+	plt.rcParams["font.family"] = ["sans-serif"]
+	plt.rcParams["font.sans-serif"] = [
+		"Noto Sans CJK SC",
+		"Source Han Sans SC",
+		"Microsoft YaHei",
+		"SimHei",
+		"SimSun",
+		"DejaVu Sans",
+	]
+	plt.rcParams["axes.unicode_minus"] = False
+	return None
+
+
+def load_csv(upload: Optional[io.BytesIO]) -> pd.DataFrame:
+	if upload is not None:
+		upload.seek(0)
+		return pd.read_csv(upload)
+	# fallback removed: must upload
+	st.warning("请在左侧上传 CSV 文件以继续")
+	st.stop()
+
+
+def get_label_universe(df: pd.DataFrame, columns: List[str]) -> List[str]:
+	labels: List[str] = []
+	for col in columns:
+		series = df[col].dropna().astype(str)
+		labels.extend(series.unique().tolist())
+	# stable unique order by first appearance
+	seen = set()
+	ordered: List[str] = []
+	for v in labels:
+		if v not in seen:
+			seen.add(v)
+			ordered.append(v)
+	return ordered
+
+
+def compute_preds_by_majority(df: pd.DataFrame, pred_cols: List[str]) -> pd.Series:
+	# majority vote across selected prediction columns (string categories)
+	votes = df[pred_cols].astype(str)
+	mode_vals = votes.mode(axis=1, dropna=True)
+	# If multiple modes, take the first (stable)
+	return mode_vals.iloc[:, 0]
+
+
+def main() -> None:
+	st.set_page_config(page_title=APP_TITLE, layout="wide")
+	font_name = configure_chinese_font()
+	st.title(APP_TITLE)
+	st.caption("上传 CSV，选择标签列与预测列，绘制可调混淆矩阵")
+
+	with st.sidebar:
+		st.header("数据与列选择")
+		uploaded = st.file_uploader("上传 CSV 文件", type=["csv"], accept_multiple_files=False)
+		try:
+			df = load_csv(uploaded)
+		except Exception as e:
+			st.error(f"读取 CSV 失败: {e}")
+			st.stop()
+
+		st.success(f"数据已载入，形状: {df.shape[0]} 行 × {df.shape[1]} 列")
+		all_cols = df.columns.tolist()
+
+		true_col = st.selectbox("真实标签列 (y_true)", options=all_cols, index=0 if all_cols else None)
+
+		st.markdown("**预测列设置**")
+		use_majority = st.checkbox("多列投票为预测 (多数表决)", value=False)
+		if use_majority:
+			pred_cols = st.multiselect("选择多个预测列用于投票", options=[c for c in all_cols if c != true_col])
+			pred_col_selected = None
+		else:
+			pred_col_selected = st.selectbox("单列预测 (y_pred)", options=[c for c in all_cols if c != true_col])
+			pred_cols = []
+
+		st.divider()
+		st.header("矩阵与图形设置")
+		candidate_labels = get_label_universe(df, [true_col] + (pred_cols if use_majority else [pred_col_selected]))
+		label_order = st.multiselect(
+			"标签顺序/子集 (留空=自动)", options=candidate_labels, default=candidate_labels,
+			help="可重新排序或筛选，只包含需要展示的标签"
+		)
+
+		normalize = st.selectbox(
+			"归一化方式",
+			options=["none", "true", "pred", "all"],
+			index=0,
+			help="none=计数；true=按真实类别行归一化；pred=按预测列归一化；all=总体归一化",
+		)
+
+		annot = st.checkbox("显示数值注释", value=True)
+		fmt = st.text_input("注释格式 (e.g. d, .2f)", value="d" if normalize == "none" else ".2f")
+		cmap = st.selectbox("色图 (cmap)", options=sorted(m for m in plt.colormaps() if not m.endswith("_r")), index=sorted(m for m in plt.colormaps() if not m.endswith("_r")).index("viridis") if "viridis" in plt.colormaps() else 0)
+		cbar = st.checkbox("显示颜色条", value=True)
+		vmin = st.number_input("色值最小 (留空用None)", value=0.0 if normalize != "none" else 0.0)
+		vmax = st.number_input("色值最大 (留空用None)", value=1.0 if normalize != "none" else float(df.shape[0]))
+		linewidths = st.number_input("网格线宽", value=0.5, min_value=0.0, step=0.1)
+		linecolor = st.color_picker("网格线颜色", value="#FFFFFF")
+		fig_w = st.number_input("图宽 (英寸)", value=5.0, min_value=2.0, step=0.5)
+		fig_h = st.number_input("图高 (英寸)", value=5.0, min_value=2.0, step=0.5)
+		xt_rot = st.number_input("X 轴标签旋转", value=45, min_value=0, max_value=90, step=5)
+		yt_rot = st.number_input("Y 轴标签旋转", value=0, min_value=0, max_value=90, step=5)
+		font_scale = st.slider("字体缩放", min_value=0.6, max_value=2.0, value=1.0, step=0.1)
+		thresh = st.slider("注释阈值 (用于反色)", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
+
+		# 轴标题自定义
+		x_axis_title = st.text_input("X 轴标题", value="预测标签")
+		y_axis_title = st.text_input("Y 轴标题", value="真实标签")
+		plot_title = st.text_input("图标题", value="混淆矩阵")
+
+		st.divider()
+		st.header("下载与导出")
+		img_dpi = st.number_input("导出 DPI", value=200, min_value=72, step=10)
+
+	# Prepare labels
+	y_true = df[true_col].astype(str)
+	if use_majority and pred_cols:
+		y_pred = compute_preds_by_majority(df, pred_cols).astype(str)
+	else:
+		y_pred = df[pred_col_selected].astype(str)
+
+	labels = label_order if len(label_order) > 0 else get_label_universe(df, [true_col] + (pred_cols if use_majority else [pred_col_selected]))
+
+	norm_param: Optional[str]
+	if normalize == "none":
+		norm_param = None
+	elif normalize == "true":
+		norm_param = "true"
+	elif normalize == "pred":
+		norm_param = "pred"
+	else:
+		norm_param = "all"
+
+	cm = confusion_matrix(y_true, y_pred, labels=labels, normalize=norm_param)
+
+	sns.set_theme(style="white", font_scale=font_scale)
+	fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+	sns.heatmap(
+		cm,
+		annot=annot,
+		fmt=fmt,
+		cmap=cmap,
+		cbar=cbar,
+		vmin=None if vmin is None else vmin,
+		vmax=None if vmax is None else vmax,
+		linewidths=linewidths,
+		linecolor=linecolor,
+		square=True,
+		ax=ax,
+		annot_kws={"color": "black"},
+	)
+	if font_name:
+		ax.set_xlabel(x_axis_title, fontname=font_name)
+		ax.set_ylabel(y_axis_title, fontname=font_name)
+		ax.set_title(plot_title, fontname=font_name)
+	else:
+		ax.set_xlabel(x_axis_title)
+		ax.set_ylabel(y_axis_title)
+		ax.set_title(plot_title)
+	ax.set_xticklabels(labels, rotation=xt_rot, ha="right")
+	ax.set_yticklabels(labels, rotation=yt_rot)
+	# 强制刻度文字使用中文字体（如可用）
+	if font_name:
+		for t in ax.get_xticklabels() + ax.get_yticklabels():
+			t.set_fontname(font_name)
+	col1, col2 = st.columns([1, 1])
+	with col1:
+		st.pyplot(fig, clear_figure=True)
+		buf = io.BytesIO()
+		fig.savefig(buf, format="png", dpi=img_dpi, bbox_inches="tight")
+		buf.seek(0)
+		st.download_button("下载图像 (PNG)", data=buf, file_name="confusion_matrix.png", mime="image/png")
+	with col2:
+		with st.expander("查看数据预览"):
+			st.dataframe(df.head(50))
+
+
+if __name__ == "__main__":
+	main()
