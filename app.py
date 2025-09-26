@@ -201,9 +201,18 @@ def main() -> None:
 		font_scale = st.slider("字体缩放", min_value=0.6, max_value=2.0, value=1.0, step=0.1)
 		thresh = st.slider("注释阈值 (用于反色)", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
 
+		# 轴方向（明确 y_true/y_pred 对应的轴）
+		axis_orientation = st.selectbox(
+			"轴方向",
+			options=["行=真实 (y_true), 列=预测 (y_pred) — 标准", "行=预测 (y_pred), 列=真实 (y_true) — 转置"],
+			index=0,
+		)
+
 		# 轴标题自定义
-		x_axis_title = st.text_input("X 轴标题", value="预测标签")
-		y_axis_title = st.text_input("Y 轴标题", value="真实标签")
+		default_x_title = "预测标签" if axis_orientation.startswith("行=真实") else "真实标签"
+		default_y_title = "真实标签" if axis_orientation.startswith("行=真实") else "预测标签"
+		x_axis_title = st.text_input("X 轴标题", value=default_x_title)
+		y_axis_title = st.text_input("Y 轴标题", value=default_y_title)
 		plot_title = st.text_input("图标题", value="混淆矩阵")
 
 		st.divider()
@@ -233,11 +242,12 @@ def main() -> None:
 		norm_param = "all"
 
 	cm = confusion_matrix(y_true, y_pred, labels=labels, normalize=norm_param)
+	cm_plot = cm if axis_orientation.startswith("行=真实") else cm.T
 
 	sns.set_theme(style="white", font_scale=font_scale)
 	fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 	sns.heatmap(
-		cm,
+		cm_plot,
 		annot=annot,
 		fmt=fmt,
 		cmap=cmap,
